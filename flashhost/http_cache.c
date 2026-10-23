@@ -11,9 +11,11 @@
  *     lidos; com status 200, grava no disco ao final.
  *
  * Regras (as mesmas do cache do Ruffle no cliente Android):
- *   - nomes com hash de conteúdo (nome_1a2b3c4d.ext) nunca mudam: sempre válidos;
+ *   - nomes com hash de conteúdo (nome_1a2b3c4d.ext) nunca mudam: sempre válidos,
+ *     e valem para todos os servidores do mesmo domínio;
  *   - os demais valem por 10% do tempo desde Last-Modified, até 7 dias;
- *     depois disso são baixados de novo;
+ *     depois disso são revalidados com If-Modified-Since: no 304, o arquivo
+ *     do disco é entregue e volta a valer;
  *   - só recursos estáticos (pela extensão) e nunca pedidos com "rnd=",
  *     exceto nomes com hash.
  */
@@ -82,15 +84,28 @@ static BOOL cache_key(const char *url, char *key, size_t size, BOOL *immutable)
 
     *immutable = ends_with_hash(slash, (dot - 1) - slash);
     if (*immutable) {
-        /* O hash identifica o conteúdo: a query não importa. */
-        if (path_len >= size) return FALSE;
-        memcpy(key, url, path_len);
-        key[path_len] = 0;
+        /*
+         * O hash identifica o conteúdo: esquema e query não importam, e os
+         * servidores do mesmo domínio (res1265oas, res1217oas...) compartilham
+         * a entrada, pois servem os mesmos arquivos.
+         */
+        const char *host = strstr(url, "://") + 3, *host_end = host, *domain, *path;
+        int dots = 0;
+        while (*host_end && *host_end != '/' && *host_end != '?' && *host_end != ':') host_end++;
+        for (domain = host_end; domain > host && !(domain[-1] == '.' && ++dots == 2); domain--);
+        if (strspn(host, "0123456789.") >= (size_t)(host_end - host)) domain = host; /* IP inteiro */
+        for (path = host_end; *path && *path != '/' && *path != '?'; path++);
+        if (snprintf(key, size, "immutable:%.*s%.*s", (int)(host_end - domain), domain,
+                     (int)(path_end - path), path) >= (int)size)
+            return FALSE;
         return TRUE;
     }
     if (query && (strstr(query, "?rnd=") || strstr(query, "&rnd="))) return FALSE;
-    if (strlen(url) >= size) return FALSE;
-    strcpy(key, url);
+    if (query && !query[1]) path_len = query - url; /* "x.png?" e "x.png" são o mesmo pedido */
+    else path_len = strlen(url);
+    if (path_len >= size) return FALSE;
+    memcpy(key, url, path_len);
+    key[path_len] = 0;
     return TRUE;
 }
 
@@ -187,11 +202,17 @@ static char *to_utf8(const WCHAR *text)
 struct protocol {
     IInternetProtocol IInternetProtocol_iface;
     IInternetProtocolSink IInternetProtocolSink_iface; /* entregue ao tratador de rede */
+    IServiceProvider IServiceProvider_iface;           /* idem, para acrescentar cabeçalhos */
+    IHttpNegotiate IHttpNegotiate_iface;
     LONG ref;
     IInternetProtocolSink *sink;  /* do urlmon */
     IInternetProtocol *network;   /* tratador HTTP(S) padrão, em caso de falha */
+    IHttpNegotiate *negotiate;    /* do urlmon, envolvido por IHttpNegotiate_iface */
     char key[2048];
     BOOL cacheable, immutable, from_cache, stored;
+    struct entry stale;           /* entrada vencida, revalidada com o servidor */
+    BOOL have_stale, revalidated, served;
+    DWORD started;                /* GetTickCount() no Start, para o log */
     char content_type[128];
     BYTE *data;                   /* acerto: corpo inteiro; falha: bytes já lidos */
     DWORD size, capacity, position;
@@ -216,8 +237,11 @@ static HRESULT WINAPI protocol_QueryInterface(IInternetProtocol *iface, REFIID r
         IInternetProtocol_AddRef(iface);
         return S_OK;
     }
-    /* Status e cabeçalhos HTTP (IWinInetHttpInfo) vêm do tratador de rede. */
-    if (This->network) return IInternetProtocol_QueryInterface(This->network, riid, out);
+    /*
+     * Status e cabeçalhos HTTP (IWinInetHttpInfo) vêm do tratador de rede;
+     * depois de um 304 eles não descrevem o corpo entregue, como num acerto.
+     */
+    if (This->network && !This->revalidated) return IInternetProtocol_QueryInterface(This->network, riid, out);
     *out = NULL;
     return E_NOINTERFACE;
 }
@@ -233,7 +257,9 @@ static ULONG WINAPI protocol_Release(IInternetProtocol *iface)
     ULONG ref = InterlockedDecrement(&This->ref);
     if (!ref) {
         if (This->network) IInternetProtocol_Release(This->network);
+        if (This->negotiate) IHttpNegotiate_Release(This->negotiate);
         if (This->sink) IInternetProtocolSink_Release(This->sink);
+        if (This->have_stale) free(This->stale.body);
         free(This->data);
         free(This);
     }
@@ -272,6 +298,37 @@ static DWORD query_status(IInternetProtocol *network)
     return status;
 }
 
+/* Entrega ao urlmon o corpo que está em This->data, como o protocolo file. */
+static void serve_cached(struct protocol *This)
+{
+    WCHAR mime[128];
+    This->from_cache = TRUE;
+    This->position = 0;
+    MultiByteToWideChar(CP_UTF8, 0, This->content_type, -1, mime, ARRAYSIZE(mime));
+    if (mime[0]) {
+        IInternetProtocolSink_ReportProgress(This->sink, BINDSTATUS_MIMETYPEAVAILABLE, mime);
+        IInternetProtocolSink_ReportProgress(This->sink, BINDSTATUS_VERIFIEDMIMETYPEAVAILABLE, mime);
+    }
+    IInternetProtocolSink_ReportData(This->sink, BSCF_FIRSTDATANOTIFICATION | BSCF_LASTDATANOTIFICATION |
+                                     BSCF_DATAFULLYAVAILABLE, This->size, This->size);
+    IInternetProtocolSink_ReportResult(This->sink, S_OK, 0, NULL);
+}
+
+/* O servidor respondeu 304: entrega a entrada vencida e a marca como válida de novo. */
+static void serve_revalidated(struct protocol *This)
+{
+    if (This->served) return;
+    This->served = TRUE;
+    fprintf(stderr, "flashhost: cache 304 ms=%u %s\n", (unsigned)(GetTickCount() - This->started), This->key);
+    free(This->data);
+    This->data = This->stale.body;
+    This->size = This->stale.size;
+    This->have_stale = FALSE; /* o corpo agora pertence a This->data */
+    snprintf(This->content_type, sizeof(This->content_type), "%s", This->stale.content_type);
+    write_entry(This->key, This->content_type, This->stale.last_modified, FALSE, This->data, This->size);
+    serve_cached(This);
+}
+
 static HRESULT WINAPI protocol_Start(IInternetProtocol *iface, LPCWSTR url, IInternetProtocolSink *sink,
                                      IInternetBindInfo *bind_info, DWORD flags, HANDLE_PTR reserved)
 {
@@ -282,29 +339,24 @@ static HRESULT WINAPI protocol_Start(IInternetProtocol *iface, LPCWSTR url, IInt
 
     This->sink = sink;
     IInternetProtocolSink_AddRef(sink);
+    This->started = GetTickCount();
     This->cacheable = cache_key(utf8, This->key, sizeof(This->key), &This->immutable);
     if (This->cacheable && read_entry(This->key, &entry)) {
         if (entry_is_fresh(&entry, time(NULL))) {
-            WCHAR mime[128];
             fprintf(stderr, "flashhost: cache acerto %s\n", This->key);
             free(utf8);
-            This->from_cache = TRUE;
             This->data = entry.body;
             This->size = entry.size;
-            MultiByteToWideChar(CP_UTF8, 0, entry.content_type, -1, mime, ARRAYSIZE(mime));
-            if (mime[0]) {
-                IInternetProtocolSink_ReportProgress(sink, BINDSTATUS_MIMETYPEAVAILABLE, mime);
-                IInternetProtocolSink_ReportProgress(sink, BINDSTATUS_VERIFIEDMIMETYPEAVAILABLE, mime);
-            }
-            IInternetProtocolSink_ReportData(sink, BSCF_FIRSTDATANOTIFICATION | BSCF_LASTDATANOTIFICATION |
-                                             BSCF_DATAFULLYAVAILABLE, This->size, This->size);
-            IInternetProtocolSink_ReportResult(sink, S_OK, 0, NULL);
+            snprintf(This->content_type, sizeof(This->content_type), "%s", entry.content_type);
+            serve_cached(This);
             return S_OK;
         }
-        free(entry.body);
+        This->stale = entry;
+        This->have_stale = TRUE;
     }
 
-    fprintf(stderr, "flashhost: cache %s %s\n", This->cacheable ? "falha" : "ignorado", utf8);
+    fprintf(stderr, "flashhost: cache %s %s\n",
+            This->have_stale ? "revalidar" : This->cacheable ? "falha" : "ignorado", utf8);
     hr = CoCreateInstance(strncmp(utf8, "https:", 6) ? &CLSID_HttpProtocol : &CLSID_HttpSProtocol,
                           NULL, CLSCTX_INPROC_SERVER, &IID_IInternetProtocol, (void **)&This->network);
     free(utf8);
@@ -373,8 +425,9 @@ static HRESULT WINAPI protocol_Read(IInternetProtocol *iface, void *buffer, ULON
         This->stored = TRUE;
         DWORD status = query_status(This->network);
         long long last_modified = query_last_modified(This->network);
-        fprintf(stderr, "flashhost: cache fim status=%u bytes=%u last-modified=%lld %s\n",
-                (unsigned)status, (unsigned)This->size, last_modified, This->key);
+        fprintf(stderr, "flashhost: cache fim status=%u bytes=%u ms=%u last-modified=%lld %s\n",
+                (unsigned)status, (unsigned)This->size, (unsigned)(GetTickCount() - This->started),
+                last_modified, This->key);
         if (status == 200)
             write_entry(This->key, This->content_type, last_modified, This->immutable, This->data,
                         This->size);
@@ -416,6 +469,12 @@ static HRESULT WINAPI psink_QueryInterface(IInternetProtocolSink *iface, REFIID 
         IInternetProtocolSink_AddRef(iface);
         return S_OK;
     }
+    /* O tratador de rede pega o IHttpNegotiate por aqui (cabeçalhos condicionais). */
+    if (This->have_stale && IsEqualIID(riid, &IID_IServiceProvider)) {
+        *out = &This->IServiceProvider_iface;
+        IServiceProvider_AddRef(&This->IServiceProvider_iface);
+        return S_OK;
+    }
     return IInternetProtocolSink_QueryInterface(This->sink, riid, out);
 }
 
@@ -437,6 +496,9 @@ static HRESULT WINAPI psink_Switch(IInternetProtocolSink *iface, PROTOCOLDATA *d
 static HRESULT WINAPI psink_ReportProgress(IInternetProtocolSink *iface, ULONG status, LPCWSTR text)
 {
     struct protocol *This = impl_from_sink(iface);
+    if (This->revalidated && (status == BINDSTATUS_MIMETYPEAVAILABLE ||
+                              status == BINDSTATUS_VERIFIEDMIMETYPEAVAILABLE))
+        return S_OK; /* o MIME do 304 não é o do corpo; serve_cached informa o certo */
     if (text && (status == BINDSTATUS_MIMETYPEAVAILABLE || status == BINDSTATUS_VERIFIEDMIMETYPEAVAILABLE))
         WideCharToMultiByte(CP_UTF8, 0, text, -1, This->content_type, sizeof(This->content_type), NULL, NULL);
     return IInternetProtocolSink_ReportProgress(This->sink, status, text);
@@ -444,18 +506,163 @@ static HRESULT WINAPI psink_ReportProgress(IInternetProtocolSink *iface, ULONG s
 
 static HRESULT WINAPI psink_ReportData(IInternetProtocolSink *iface, DWORD flags, ULONG progress, ULONG max)
 {
-    return IInternetProtocolSink_ReportData(impl_from_sink(iface)->sink, flags, progress, max);
+    struct protocol *This = impl_from_sink(iface);
+    if (This->revalidated) {
+        serve_revalidated(This);
+        return S_OK;
+    }
+    return IInternetProtocolSink_ReportData(This->sink, flags, progress, max);
 }
 
 static HRESULT WINAPI psink_ReportResult(IInternetProtocolSink *iface, HRESULT result, DWORD error,
                                          LPCWSTR text)
 {
-    return IInternetProtocolSink_ReportResult(impl_from_sink(iface)->sink, result, error, text);
+    struct protocol *This = impl_from_sink(iface);
+    if (This->revalidated) {
+        serve_revalidated(This);
+        return S_OK;
+    }
+    return IInternetProtocolSink_ReportResult(This->sink, result, error, text);
 }
 
 static IInternetProtocolSinkVtbl psink_vtbl = {
     psink_QueryInterface, psink_AddRef, psink_Release, psink_Switch,
     psink_ReportProgress, psink_ReportData, psink_ReportResult,
+};
+
+/*
+ * IServiceProvider e IHttpNegotiate entregues ao tratador de rede quando há
+ * entrada vencida: acrescentam If-Modified-Since e detectam o 304. O resto
+ * vai para os do urlmon.
+ */
+
+static struct protocol *impl_from_service(IServiceProvider *iface)
+{
+    return CONTAINING_RECORD(iface, struct protocol, IServiceProvider_iface);
+}
+
+static HRESULT WINAPI service_QueryInterface(IServiceProvider *iface, REFIID riid, void **out)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IServiceProvider)) {
+        *out = iface;
+        IServiceProvider_AddRef(iface);
+        return S_OK;
+    }
+    return psink_QueryInterface(&impl_from_service(iface)->IInternetProtocolSink_iface, riid, out);
+}
+
+static ULONG WINAPI service_AddRef(IServiceProvider *iface)
+{
+    return protocol_AddRef(&impl_from_service(iface)->IInternetProtocol_iface);
+}
+
+static ULONG WINAPI service_Release(IServiceProvider *iface)
+{
+    return protocol_Release(&impl_from_service(iface)->IInternetProtocol_iface);
+}
+
+static HRESULT WINAPI service_QueryService(IServiceProvider *iface, REFGUID service, REFIID riid, void **out)
+{
+    struct protocol *This = impl_from_service(iface);
+    IServiceProvider *outer;
+    HRESULT hr;
+
+    *out = NULL;
+    hr = IInternetProtocolSink_QueryInterface(This->sink, &IID_IServiceProvider, (void **)&outer);
+    if (FAILED(hr)) return hr;
+    if (IsEqualGUID(service, &IID_IHttpNegotiate) && IsEqualIID(riid, &IID_IHttpNegotiate)) {
+        if (!This->negotiate)
+            hr = IServiceProvider_QueryService(outer, service, riid, (void **)&This->negotiate);
+        if (SUCCEEDED(hr)) {
+            *out = &This->IHttpNegotiate_iface;
+            IHttpNegotiate_AddRef(&This->IHttpNegotiate_iface);
+        }
+    } else {
+        hr = IServiceProvider_QueryService(outer, service, riid, out);
+    }
+    IServiceProvider_Release(outer);
+    return hr;
+}
+
+static IServiceProviderVtbl service_vtbl = {
+    service_QueryInterface, service_AddRef, service_Release, service_QueryService,
+};
+
+static struct protocol *impl_from_negotiate(IHttpNegotiate *iface)
+{
+    return CONTAINING_RECORD(iface, struct protocol, IHttpNegotiate_iface);
+}
+
+static HRESULT WINAPI negotiate_QueryInterface(IHttpNegotiate *iface, REFIID riid, void **out)
+{
+    if (IsEqualIID(riid, &IID_IUnknown) || IsEqualIID(riid, &IID_IHttpNegotiate)) {
+        *out = iface;
+        IHttpNegotiate_AddRef(iface);
+        return S_OK;
+    }
+    *out = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI negotiate_AddRef(IHttpNegotiate *iface)
+{
+    return protocol_AddRef(&impl_from_negotiate(iface)->IInternetProtocol_iface);
+}
+
+static ULONG WINAPI negotiate_Release(IHttpNegotiate *iface)
+{
+    return protocol_Release(&impl_from_negotiate(iface)->IInternetProtocol_iface);
+}
+
+static HRESULT WINAPI negotiate_BeginningTransaction(IHttpNegotiate *iface, LPCWSTR url, LPCWSTR headers,
+                                                     DWORD reserved, LPWSTR *additional)
+{
+    struct protocol *This = impl_from_negotiate(iface);
+    ULONGLONG ticks = (ULONGLONG)This->stale.last_modified * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft = {(DWORD)ticks, (DWORD)(ticks >> 32)};
+    char date[INTERNET_RFC1123_BUFSIZE], header[INTERNET_RFC1123_BUFSIZE + 32];
+    SYSTEMTIME st;
+    int old_len, len;
+    LPWSTR combined;
+    HRESULT hr;
+
+    *additional = NULL;
+    hr = IHttpNegotiate_BeginningTransaction(This->negotiate, url, headers, reserved, additional);
+    if (FAILED(hr) || !FileTimeToSystemTime(&ft, &st) ||
+        !InternetTimeFromSystemTimeA(&st, INTERNET_RFC1123_FORMAT, date, sizeof(date)))
+        return hr;
+    snprintf(header, sizeof(header), "If-Modified-Since: %s\r\n", date);
+    len = MultiByteToWideChar(CP_ACP, 0, header, -1, NULL, 0); /* inclui o terminador */
+    old_len = *additional ? lstrlenW(*additional) : 0;
+    if (!(combined = CoTaskMemAlloc((old_len + len) * sizeof(WCHAR)))) return hr;
+    if (old_len) memcpy(combined, *additional, old_len * sizeof(WCHAR));
+    MultiByteToWideChar(CP_ACP, 0, header, -1, combined + old_len, len);
+    CoTaskMemFree(*additional);
+    *additional = combined;
+    return S_OK;
+}
+
+static HRESULT WINAPI negotiate_OnResponse(IHttpNegotiate *iface, DWORD code, LPCWSTR response_headers,
+                                           LPCWSTR request_headers, LPWSTR *additional)
+{
+    struct protocol *This = impl_from_negotiate(iface);
+    fprintf(stderr, "flashhost: cache resposta %u %s\n", (unsigned)code, This->key);
+    if (code == HTTP_STATUS_NOT_MODIFIED) {
+        /*
+         * Para o Flash, a resposta é o corpo do disco, como num acerto (em que
+         * OnResponse nunca é chamado): os cabeçalhos do 304 (Content-Length: 0)
+         * o fariam descartar o arquivo.
+         */
+        This->revalidated = TRUE;
+        if (additional) *additional = NULL;
+        return S_OK;
+    }
+    return IHttpNegotiate_OnResponse(This->negotiate, code, response_headers, request_headers, additional);
+}
+
+static IHttpNegotiateVtbl negotiate_vtbl = {
+    negotiate_QueryInterface, negotiate_AddRef, negotiate_Release, negotiate_BeginningTransaction,
+    negotiate_OnResponse,
 };
 
 /* ---- Fábrica e registro ---- */
@@ -482,6 +689,8 @@ static HRESULT WINAPI factory_CreateInstance(IClassFactory *iface, IUnknown *out
     if (!(This = calloc(1, sizeof(*This)))) return E_OUTOFMEMORY;
     This->IInternetProtocol_iface.lpVtbl = &protocol_vtbl;
     This->IInternetProtocolSink_iface.lpVtbl = &psink_vtbl;
+    This->IServiceProvider_iface.lpVtbl = &service_vtbl;
+    This->IHttpNegotiate_iface.lpVtbl = &negotiate_vtbl;
     This->ref = 1;
     hr = IInternetProtocol_QueryInterface(&This->IInternetProtocol_iface, riid, out);
     IInternetProtocol_Release(&This->IInternetProtocol_iface);
