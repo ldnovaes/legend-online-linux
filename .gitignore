@@ -1,0 +1,6 @@
+__pycache__/
+.venv/
+.local/
+artifacts/
+build/
+*.env
