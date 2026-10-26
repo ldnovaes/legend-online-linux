@@ -13,7 +13,7 @@ The [Linux release bundle](https://github.com/ldnovaes/legend-online-linux/relea
 - Microsoft core fonts in that prefix, including Arial and Verdana.
 - Internet access and a Legend Online account.
 
-The proprietary Flash runtime is **not bundled**. On first launch, `run.sh` fetches it from Adobe's official installer archive, which is served by the Wayback Machine. You can also fetch it manually with `.venv/bin/python -m legendclient.flash`. This downloads `fp_15.0.0.167_archive.zip` (~53 MB), checks its SHA-256, and extracts `Flash64_15_0_0_167.ocx` from the ActiveX installer without running it. The result goes to `.local/flash/` and is verified again. Nothing is installed or registered in Wine. The OCX is loaded directly by the host.
+The proprietary Flash runtime is **not bundled**. On first launch, `run.sh` fetches it from Adobe's official installer archive, which is served by the Wayback Machine. You can also fetch it manually with `.venv/bin/python -m legendclient.flash`. This downloads `fp_15.0.0.167_archive.zip` (~53 MB), checks its SHA-256, and extracts `Flash64_15_0_0_167.ocx` from the ActiveX installer without running it. The result goes to `.local/flash/` and is verified again. Nothing is installed in Wine. The host loads the OCX directly and registers only its type library in the prefix.
 
 A Wine prefix is still required for the fonts below; installing Wine alone is not sufficient. The default prefix is `~/Games/legend-online`. Set `WINEPREFIX` to select another one. `LEGENDCLIENT_FLASH_OCX` overrides the OCX path. Without either, an OCX already present in the prefix is used as a fallback.
 
