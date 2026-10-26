@@ -12,8 +12,9 @@
  *   width=1280 / height=760        área cliente inicial
  *   cache=/caminho/unix            cache de disco dos downloads (http_cache.c)
  *
- * O OCX é carregado diretamente (LoadLibrary + DllGetClassObject), sem
- * registro no prefixo, e anexado à janela com AtlAxAttachControl.
+ * O OCX é carregado diretamente (LoadLibrary + DllGetClassObject) e anexado
+ * à janela com AtlAxAttachControl. A única entrada no registro do prefixo é a
+ * typelib embutida no OCX, que o IDispatch do Flash exige (ver create_flash).
  */
 #define COBJMACROS
 #include <windows.h>
@@ -357,11 +358,19 @@ static IUnknown *create_flash(const WCHAR *ocx_path)
     HRESULT (WINAPI *get_class)(REFCLSID, REFIID, void **);
     IClassFactory *factory;
     IUnknown *control = NULL;
+    ITypeLib *typelib;
     HMODULE ocx = LoadLibraryW(ocx_path);
     if (!ocx) {
         fprintf(stderr, "flashhost: LoadLibrary do OCX falhou (erro %u)\n", (unsigned)GetLastError());
         return NULL;
     }
+    /* O IDispatch do Flash resolve nomes (Movie, FlashVars...) pela typelib
+     * registrada; sem ela todas as propriedades são recusadas. Registrar a
+     * cada execução mantém o caminho correto se o OCX mudar de lugar. */
+    if (SUCCEEDED(LoadTypeLibEx(ocx_path, REGKIND_REGISTER, &typelib)))
+        ITypeLib_Release(typelib);
+    else
+        fprintf(stderr, "flashhost: aviso: typelib do OCX não registrada\n");
     if (!patch_import(ocx, "urlmon.dll", "RegisterBindStatusCallback",
                       hook_RegisterBindStatusCallback, (void **)&real_RegisterBindStatusCallback))
         fprintf(stderr, "flashhost: aviso: correção de download não aplicada\n");

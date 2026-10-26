@@ -1,8 +1,12 @@
+import lzma
+import os
+import struct
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
-from legendclient import game, servers
+from legendclient import flash, game, servers
 
 PORTAL_HTML = """
 <div class="server_played">
@@ -99,6 +103,55 @@ class FontCheckTest(unittest.TestCase):
             fonts.mkdir(parents=True)
             (fonts / "Arial.TTF").touch()
             self.assertEqual(game.missing_fonts(prefix), ["verdana.ttf"])
+
+
+class FindOcxTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.prefix = self.root / "prefix"
+        self.bundled = self.root / "Flash64.ocx"
+        patcher = mock.patch.object(flash, "OCX_PATH", self.bundled)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("LEGENDCLIENT_FLASH_OCX", None)
+
+    def test_reports_how_to_install_when_missing(self):
+        with self.assertRaisesRegex(game.GameError, "legendclient.flash"):
+            game.find_ocx(self.prefix)
+
+    def test_prefers_project_ocx_over_prefix(self):
+        legacy = self.prefix / "drive_c/Program Files/App/flash/Flash64_1.ocx"
+        legacy.parent.mkdir(parents=True)
+        legacy.touch()
+        self.assertEqual(game.find_ocx(self.prefix), legacy)
+        self.bundled.touch()
+        self.assertEqual(game.find_ocx(self.prefix), self.bundled)
+
+    def test_environment_overrides_everything(self):
+        self.bundled.touch()
+        custom = self.root / "custom.ocx"
+        custom.touch()
+        os.environ["LEGENDCLIENT_FLASH_OCX"] = str(custom)
+        self.assertEqual(game.find_ocx(self.prefix), custom)
+
+
+class FlashUnpackTest(unittest.TestCase):
+    def test_unpacks_installer_resource(self):
+        payload = b"MZ" + bytes(range(256)) * 64
+        raw = lzma.compress(payload, format=lzma.FORMAT_RAW, filters=[
+            {"id": lzma.FILTER_LZMA1, "dict_size": 1 << 16, "lc": 3, "lp": 0, "pb": 2}])
+        blob = b"\x02\x01\x00\x00" + bytes(7) + struct.pack("<BI", 0x5D, 1 << 16) + raw
+        self.assertEqual(flash.unpack(blob)[:len(payload)], payload)
+
+    def test_rejects_corrupt_resource(self):
+        blob = bytes(11) + struct.pack("<BI", 0x5D, 1 << 16) + b"\xff" * 32
+        with self.assertRaises(flash.FlashError):
+            flash.unpack(blob)
 
 
 class TrimCacheTest(unittest.TestCase):

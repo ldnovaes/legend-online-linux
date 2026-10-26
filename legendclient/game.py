@@ -11,6 +11,8 @@ import subprocess
 import time
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit
 
+from . import flash
+
 PROJECT = Path(__file__).resolve().parents[1]
 HOST_DIR = PROJECT / "flashhost"
 # winegcc gera flashhost.exe (script de shell) e flashhost.exe.so (o programa);
@@ -109,6 +111,8 @@ def find_ocx(prefix):
         if not Path(configured).is_file():
             raise GameError(f"LEGENDCLIENT_FLASH_OCX não existe: {configured}")
         return Path(configured)
+    if flash.OCX_PATH.is_file():
+        return flash.OCX_PATH
     drive = prefix / "drive_c"
     candidates = [
         *drive.glob("windows/system32/Macromed/Flash/Flash*.ocx"),
@@ -116,8 +120,8 @@ def find_ocx(prefix):
         *drive.glob("Program Files/*/Flash64*.ocx"),
     ]
     if not candidates:
-        raise GameError("controle Flash (OCX 64 bits) não encontrado no prefixo; "
-                        "defina LEGENDCLIENT_FLASH_OCX")
+        raise GameError("controle Flash (OCX 64 bits) não encontrado; instale-o com "
+                        "`python -m legendclient.flash` ou defina LEGENDCLIENT_FLASH_OCX")
     return sorted(candidates)[-1]
 
 
